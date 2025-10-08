@@ -1,45 +1,37 @@
 #!/usr/bin/env python3
 """
-Drop-in replacement script (robust + unit-aware):
-
-- Builds a single, continuous flight path (unbroken) and a matching “curtain”
-  (vertical drop to terrain) using <extrude>1</extrude>.
-- Provides separate visualizations for Altitude, Climb Rate, and Speed:
-  • a single continuous “Full Path (single line)” + curtain
-  • a “Colored Segments” subfolder (to mimic your sample’s color-by-value look)
-- Takeoff/Landing markers.
-- If input has >10,000 points, resamples (interpolates) uniformly in time to ≤10,000.
-- **All styles are defined once at the top-level <Document>** (prevents “style does not exist”).
-- **Defensively avoids zero-length lines**: any line with < 2 unique coordinates is skipped.
-- **Unit control**: `--units {metric,imperial}` affects the value *ranges* used to color Speed
-  and Climb (and Altitude if you choose fixed bands). KML altitudes remain meters as required.
-
-Usage:
-  python igc_to_kml.py path/to/flight.igc
-  python igc_to_kml.py path/to/flight.igc -o out.kml --max-points 10000 --units imperial
-  python igc_to_kml.py path/to/flight.igc --band-mode auto  # use data-driven color bands
+IGC → KML (drop-in replacement, corrected climb methodology)
+- Continuous flight path + matching “curtains” (via <extrude>1</extrude>)
+- Three visualizations: Altitude, Climb rate, Speed — colored violet→…→red
+- Altitude colors: exact min (violet) → max (red)
+- Speed & Climb colors: robust mean-centered ranges (middle 5–95%), speed ignores near-zero for range
+- Climb rate now computed from **barometric altitude** when available (auto-fallback to GPS)
+- Prevents 0,0 import errors; curtains always match segment color
+- ≤ 10,000 output points (uniform time resampling)
 """
 
 import re
 from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Dict
+
+# --------------------------- CONFIG ---------------------------
+
+Q_LOW  = 0.05   # robust trimming lower quantile
+Q_HIGH = 0.95   # robust trimming upper quantile
+MIN_RUN_PTS = 5 # merge tiny color runs to avoid “dashes”
 
 # --------------------------- IGC PARSING ---------------------------
 
 def parse_igc_datetime_and_points(igc_text: str):
-    """
-    Parses an IGC file into (date, points). Each point is a dict with keys:
-    time (datetime), lat (float), lon (float), alt_gps (float m), alt_press (int), valid (bool)
-    """
     m = re.search(r"HFDTEDATE:(\d{6})", igc_text)
     if not m:
         m = re.search(r"HFDTE(\d{6})", igc_text)
     if not m:
         raise ValueError("Could not find date (HFDTEDATE/HFDTE) in IGC.")
     dd, mm, yy = m.group(1)[0:2], m.group(1)[2:4], m.group(1)[4:6]
-    year = 2000 + int(yy)  # interpret YY as 20YY
+    year = 2000 + int(yy)
     igc_date = datetime(year, int(mm), int(dd))
 
     points: List[dict] = []
@@ -55,8 +47,8 @@ def parse_igc_datetime_and_points(igc_text: str):
             lon_mm_thousandths = int(line[18:23])
             lon_hem = line[23]
             fix_valid = line[24]
-            alt_press = int(line[25:30])      # pressure altitude (m)
-            alt_gps = float(line[30:35])      # GPS altitude (m)
+            alt_press = int(line[25:30])      # meters (barometric altitude)
+            alt_gps = float(line[30:35])      # meters (GPS altitude)
 
             lat = lat_deg + (lat_mm_thousandths / 1000.0) / 60.0
             lon = lon_deg + (lon_mm_thousandths / 1000.0) / 60.0
@@ -69,14 +61,14 @@ def parse_igc_datetime_and_points(igc_text: str):
                 "time": timestamp,
                 "lat": lat,
                 "lon": lon,
-                "alt_gps": alt_gps,   # meters
-                "alt_press": alt_press,
+                "alt_gps": alt_gps,     # meters (used for KML Z)
+                "alt_press": alt_press, # meters (preferred for climb rate)
                 "valid": (fix_valid == 'A')
             })
         except Exception:
             continue
 
-    # Handle potential midnight rollover (large backward jump)
+    # Midnight rollover handling
     for i in range(1, len(points)):
         if points[i]["time"] < points[i-1]["time"]:
             if (points[i-1]["time"] - points[i]["time"]).total_seconds() > 12*3600:
@@ -110,38 +102,35 @@ def compute_speeds_mps(points: List[dict]) -> List[float]:
         speeds[i] = d / dt
     return speeds
 
+def choose_altitude_series_for_climb(points: List[dict]) -> List[float]:
+    """Prefer barometric altitude if it looks valid and non-flat; else GPS."""
+    alt_press = [p["alt_press"] for p in points]
+    alt_gps   = [p["alt_gps"]   for p in points]
+
+    # Heuristics: enough nonzero, enough variance
+    nonzero_press = sum(1 for a in alt_press if a != 0)
+    var_press = (max(alt_press) - min(alt_press)) if alt_press else 0
+    if nonzero_press > len(points) * 0.7 and var_press > 1.0:
+        return alt_press
+    return alt_gps
+
 def compute_climb_mps(points: List[dict]) -> List[float]:
+    """
+    Vertical speed for segment (i-1 → i), in m/s.
+    Uses barometric altitude when available; falls back to GPS otherwise.
+    The first sample inherits the second segment’s rate for consistent coloring.
+    """
+    alts = choose_altitude_series_for_climb(points)
     climbs = [0.0] * len(points)
     for i in range(1, len(points)):
         dt = (points[i]["time"] - points[i-1]["time"]).total_seconds()
         if dt <= 0:
-            climbs[i] = 0.0
+            climbs[i] = climbs[i-1] if i > 0 else 0.0
             continue
-        climbs[i] = (points[i]["alt_gps"] - points[i-1]["alt_gps"]) / dt
+        climbs[i] = (alts[i] - alts[i-1]) / dt
+    if len(climbs) >= 2:
+        climbs[0] = climbs[1]
     return climbs
-
-def detect_takeoff_landing(points: List[dict]) -> Tuple[int, int]:
-    if len(points) < 2:
-        return 0, max(0, len(points)-1)
-    speeds = compute_speeds_mps(points)
-    for i, p in enumerate(points):
-        if not p.get("valid", True):
-            speeds[i] = 0.0
-    takeoff_idx = 0
-    take_win = 10
-    for i in range(take_win - 1, len(points)):
-        if all(speeds[j] > 8.0 for j in range(i - take_win + 1, i + 1)):
-            takeoff_idx = i - take_win + 1
-            break
-    landing_idx = len(points) - 1
-    land_win = 15
-    for i in range(len(points) - land_win - 1, takeoff_idx + land_win - 1, -1):
-        if all(speeds[j] < 5.0 for j in range(i, i + land_win)):
-            landing_idx = i + land_win - 1
-            break
-    takeoff_idx = max(0, min(takeoff_idx, len(points)-1))
-    landing_idx = max(takeoff_idx, min(landing_idx, len(points)-1))
-    return takeoff_idx, landing_idx
 
 def linear_interpolate(p1: dict, p2: dict, t: datetime) -> dict:
     t1, t2 = p1["time"], p2["time"]
@@ -154,7 +143,7 @@ def linear_interpolate(p1: dict, p2: dict, t: datetime) -> dict:
         "lat": p1["lat"] + u * (p2["lat"] - p1["lat"]),
         "lon": p1["lon"] + u * (p2["lon"] - p1["lon"]),
         "alt_gps": p1["alt_gps"] + u * (p2["alt_gps"] - p1["alt_gps"]),
-        "alt_press": None,
+        "alt_press": int(round(p1["alt_press"] + u * (p2["alt_press"] - p1["alt_press"]))),
         "valid": True,
     }
 
@@ -179,41 +168,81 @@ def resample_to_max(points: List[dict], max_points: int = 10000) -> List[dict]:
             res.append(linear_interpolate(points[j], points[j+1], ti))
     return res
 
-# --------------------------- UNITS & COLOR SCALES ---------------------------
-
-def color_argb(a: int, r: int, g: int, b: int) -> str:
-    return f"{a:02x}{b:02x}{g:02x}{r:02x}"
-
-def ramp_blue_red(t: float) -> Tuple[int,int,int]:
-    t = max(0.0, min(1.0, t))
-    if t < 0.25:
-        u = t/0.25; return (0, int(255*u), 255)
-    elif t < 0.5:
-        u = (t-0.25)/0.25; return (int(255*u), 255, int(255*(1-u)))
-    elif t < 0.75:
-        u = (t-0.5)/0.25; return (255, int(255*(1-u)), 0)
-    else:
-        u = (t-0.75)/0.25; return (255, int(255*(1-u)), 0)
-
-def ramp_diverging(val: float, vmax: float) -> Tuple[int,int,int]:
-    """Blue (negative) -> white (0) -> red (positive), symmetric range [-vmax, vmax]."""
-    if vmax <= 0: return (200,200,200)
-    x = max(-vmax, min(vmax, val)) / vmax  # in [-1,1]
-    if x >= 0:
-        r = int(255 * x + 255 * (1-x))
-        g = int(255 * (1-x))
-        b = int(255 * (1-x))
-    else:
-        x = -x
-        r = int(255 * (1-x))
-        g = int(255 * (1-x))
-        b = int(255 * x + 255 * (1-x))
-    return (r,g,b)
+# --------------------------- UNIT CONVERSIONS ---------------------------
 
 def mps_to_kmh(v): return v * 3.6
 def mps_to_mph(v): return v * 2.2369362921
-def mps_to_fpm(v): return v * 196.8503937  # 1 m/s = 196.85 ft/min
+def mps_to_fpm(v): return v * 196.8503937
 def m_to_ft(h):    return h * 3.280839895
+
+# --------------------------- COLOR MAP ---------------------------
+
+def color_argb(a: int, r: int, g: int, b: int) -> str:
+    # KML expects aabbggrr
+    return f"{a:02x}{b:02x}{g:02x}{r:02x}"
+
+def hex_to_rgb(hexstr: str) -> Tuple[int,int,int]:
+    hexstr = hexstr.lstrip('#')
+    return int(hexstr[0:2],16), int(hexstr[2:4],16), int(hexstr[4:6],16)
+
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+def lerp_rgb(c1: Tuple[int,int,int], c2: Tuple[int,int,int], t: float) -> Tuple[int,int,int]:
+    return (int(round(lerp(c1[0], c2[0], t))),
+            int(round(lerp(c1[1], c2[1], t))),
+            int(round(lerp(c1[2], c2[2], t))))
+
+# Rainbow stops: violet → blue → cyan → green → yellow → orange → red
+RAINBOW_STOPS = [
+    (0.00, hex_to_rgb("#4B0082")),  # violet
+    (0.16, hex_to_rgb("#0000FF")),  # blue
+    (0.33, hex_to_rgb("#00FFFF")),  # cyan
+    (0.50, hex_to_rgb("#00FF00")),  # green
+    (0.66, hex_to_rgb("#FFFF00")),  # yellow
+    (0.83, hex_to_rgb("#FFA500")),  # orange
+    (1.00, hex_to_rgb("#FF0000")),  # red
+]
+STOP_NAMES = ["violet","blue","cyan","green","yellow","orange","red"]
+
+def rainbow_color(val: float, vmin: float, vmax: float) -> Tuple[int,int,int]:
+    if vmax <= vmin:
+        t = 0.5
+    else:
+        t = (val - vmin) / (vmax - vmin)
+        t = max(0.0, min(1.0, t))
+    for i in range(len(RAINBOW_STOPS)-1):
+        t0, c0 = RAINBOW_STOPS[i]
+        t1, c1 = RAINBOW_STOPS[i+1]
+        if t0 <= t <= t1:
+            u = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+            return lerp_rgb(c0, c1, u)
+    return RAINBOW_STOPS[-1][1]
+
+def color_name_for(val: float, vmin: float, vmax: float) -> str:
+    if vmax <= vmin:
+        t = 0.5
+    else:
+        t = (val - vmin) / (vmax - vmin)
+        t = max(0.0, min(1.0, t))
+    idx = min(range(len(RAINBOW_STOPS)), key=lambda i: abs(RAINBOW_STOPS[i][0] - t))
+    return STOP_NAMES[idx]
+
+# --------------------------- DISTRIBUTION HELPERS ---------------------------
+
+def percentile(vals: List[float], p: float) -> float:
+    if not vals: return 0.0
+    s = sorted(vals)
+    k = max(0, min(len(s)-1, int(round(p*(len(s)-1)))))
+    return s[k]
+
+def trimmed_values(vals: List[float], q_low: float, q_high: float) -> List[float]:
+    if not vals: return []
+    lo = percentile(vals, q_low)
+    hi = percentile(vals, q_high)
+    if hi < lo:
+        lo, hi = hi, lo
+    return [v for v in vals if lo <= v <= hi]
 
 # --------------------------- KML HELPERS ---------------------------
 
@@ -221,92 +250,250 @@ def kml_coords_string(coords: List[Tuple[float,float,float]]) -> str:
     return "\n".join(f"{lon:.6f},{lat:.6f},{alt:.2f}" for lon,lat,alt in coords)
 
 def make_style(style_id: str, color_hex: str, width: int = 3) -> str:
-    return f"""
-    <Style id="{style_id}">
-      <LineStyle><color>{color_hex}</color><width>{width}</width></LineStyle>
-    </Style>"""
-
-def segment_runs_by_band(values: List[float], bands: List[float]) -> List[Tuple[int,int,int]]:
-    """Return list of (start_idx, end_idx_inclusive, band_index) for contiguous runs."""
-    def band_index(v: float) -> int:
-        for i in range(len(bands)-1):
-            if bands[i] <= v <= bands[i+1]:
-                return i
-        return len(bands)-2
-    runs = []
-    if not values:
-        return runs
-    cur_band = band_index(values[0])
-    start = 0
-    for i in range(1, len(values)):
-        b = band_index(values[i])
-        if b != cur_band:
-            runs.append((start, i-1, cur_band))
-            start = i
-            cur_band = b
-    runs.append((start, len(values)-1, cur_band))
-    return runs
+    return (
+        f"\n    <Style id=\"{style_id}\">\n"
+        f"      <LineStyle><color>{color_hex}</color><width>{width}</width></LineStyle>\n"
+        f"    </Style>"
+    )
 
 def ensure_style(global_styles: Dict[str,str], style_id: str, color_hex: str, width: int = 3):
     if style_id not in global_styles:
         global_styles[style_id] = make_style(style_id, color_hex, width)
 
-# Robustly remove zero-length/duplicate points so KML doesn’t create 0,0 lines
 def compress_coords(coords: List[Tuple[float,float,float]], min_2d_m: float = 0.5, min_dalt_m: float = 0.5) -> List[Tuple[float,float,float]]:
     if not coords: return coords
     kept = [coords[0]]
     for lon,lat,alt in coords[1:]:
         lon0,lat0,alt0 = kept[-1]
-        # quick reject on exact equality
         if lon == lon0 and lat == lat0 and abs(alt-alt0) < 1e-6:
             continue
-        # distance check
         d = haversine_m((lat0,lon0),(lat,lon))
         if d < min_2d_m and abs(alt-alt0) < min_dalt_m:
             continue
         kept.append((lon,lat,alt))
     return kept
 
-# --------------------------- KML BUILD ---------------------------
+def has_two_unique_coords(coords: List[Tuple[float,float,float]]) -> bool:
+    if len(coords) < 2:
+        return False
+    seen = set()
+    for lon,lat,alt in coords:
+        key = (round(lon,6), round(lat,6), round(alt,2))
+        seen.add(key)
+        if len(seen) >= 2:
+            return True
+    return False
+
+def lin_edges(vmin: float, vmax: float, bands: int) -> List[float]:
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    return [vmin + i*(vmax-vmin)/bands for i in range(bands+1)]
+
+def _band_index(val: float, edges: List[float]) -> int:
+    for i in range(len(edges)-1):
+        if edges[i] <= val <= edges[i+1]:
+            return i
+    return len(edges)-2
+
+def segment_runs_by_band(values: List[float], edges: List[float], min_run_pts: int = MIN_RUN_PTS) -> List[Tuple[int,int,int]]:
+    """Return list of (start_idx, end_idx_inclusive, band_index), merging tiny runs."""
+    if not values: return []
+    cur_band = _band_index(values[0], edges)
+    start = 0
+    runs = []
+    for i in range(1, len(values)):
+        b = _band_index(values[i], edges)
+        if b != cur_band:
+            runs.append([start, i-1, cur_band])
+            start = i
+            cur_band = b
+    runs.append([start, len(values)-1, cur_band])
+
+    if min_run_pts <= 1 or len(runs) <= 1:
+        return [(a,b,c) for a,b,c in runs]
+
+    # Merge short runs into neighbors to avoid jitter
+    merged = []
+    i = 0
+    while i < len(runs):
+        s,e,b = runs[i]
+        length = e - s + 1
+        if length >= min_run_pts or len(runs) == 1:
+            merged.append([s,e,b]); i += 1; continue
+        if merged and merged[-1][2] == b:
+            merged[-1][1] = e
+            i += 1
+        elif i+1 < len(runs) and runs[i+1][2] == b:
+            runs[i+1][0] = s
+            i += 1
+        else:
+            left_len = merged[-1][1]-merged[-1][0]+1 if merged else -1
+            right_len = runs[i+1][1]-runs[i+1][0]+1 if i+1 < len(runs) else -1
+            if right_len > left_len and i+1 < len(runs):
+                runs[i+1][0] = s
+            elif merged:
+                merged[-1][1] = e
+            else:
+                merged.append([s,e,b])
+            i += 1
+    return [(a,b,c) for a,b,c in merged]
+
+# --------------------------- RANGE / COLORS ---------------------------
+
+def build_ranges_and_colors(
+    alts_val: List[float],
+    speeds_val: List[float],
+    climbs_val: List[float],
+    units: str,
+):
+    # Units & defaults
+    if units == "imperial":
+        speed_unit, climb_unit, alt_unit = "mph", "ft/min", "ft"
+        speed_floor = 5.0
+        climb_clamp = (-1200.0, 1200.0)
+    else:
+        speed_unit, climb_unit, alt_unit = "km/h", "m/s", "m"
+        speed_floor = 8.0
+        climb_clamp = (-6.0, 6.0)
+
+    # Altitude: exact min/max
+    alt_min_enc = min(alts_val) if alts_val else 0.0
+    alt_max_enc = max(alts_val) if alts_val else 1.0
+    if alt_max_enc <= alt_min_enc:
+        alt_max_enc = alt_min_enc + 1.0
+    alt_edges = lin_edges(alt_min_enc, alt_max_enc, 12)
+
+    # Speed: ignore <= speed_floor for range, then mean-centered around trimmed middle
+    speeds_nonzero = [v for v in speeds_val if v > speed_floor] or speeds_val[:]
+    sp_trim = trimmed_values(speeds_nonzero, Q_LOW, Q_HIGH) or speeds_nonzero
+    sp_mean = sum(sp_trim)/len(sp_trim) if sp_trim else 0.0
+    sp_lo_q = percentile(speeds_nonzero, Q_LOW) if speeds_nonzero else 0.0
+    sp_hi_q = percentile(speeds_nonzero, Q_HIGH) if speeds_nonzero else 1.0
+    sp_half = max(sp_mean - sp_lo_q, sp_hi_q - sp_mean)
+    sp_range = (sp_mean - sp_half, sp_mean + sp_half)
+    sp_edges = lin_edges(sp_range[0], sp_range[1], 12)
+
+    # Climb: trimmed mean-centered, clamped to realistic bounds
+    cl_trim = trimmed_values(climbs_val, Q_LOW, Q_HIGH) or climbs_val[:]
+    cl_mean = sum(cl_trim)/len(cl_trim) if cl_trim else 0.0
+    cl_lo_q = percentile(climbs_val, Q_LOW) if climbs_val else -1.0
+    cl_hi_q = percentile(climbs_val, Q_HIGH) if climbs_val else 1.0
+    cl_half = max(cl_mean - cl_lo_q, cl_hi_q - cl_mean)
+    cl_range = (cl_mean - cl_half, cl_mean + cl_half)
+    cl_range = (max(cl_range[0], climb_clamp[0]), min(cl_range[1], climb_clamp[1]))
+    if cl_range[1] <= cl_range[0]:
+        cl_range = climb_clamp
+    cl_edges = lin_edges(cl_range[0], cl_range[1], 12)
+
+    # Color functions
+    alt_color = lambda v: rainbow_color(v, alt_edges[0], alt_edges[-1])
+    spd_color = lambda v: rainbow_color(v, sp_edges[0], sp_edges[-1])
+    clb_color = lambda v: rainbow_color(v, cl_edges[0], cl_edges[-1])
+
+    # Means for reporting
+    alt_mean = sum(alts_val)/len(alts_val) if alts_val else 0.0
+    sp_mean_all = sum(speeds_val)/len(speeds_val) if speeds_val else 0.0
+    cl_mean_all = sum(climbs_val)/len(climbs_val) if climbs_val else 0.0
+
+    report = {
+        "units": {"alt": alt_unit, "speed": speed_unit, "climb": climb_unit},
+        "quantiles": {"q_low": Q_LOW, "q_high": Q_HIGH},
+        "speed_floor": speed_floor,
+        "Altitude": {
+            "enc_min": alt_min_enc, "enc_max": alt_max_enc, "mean": alt_mean,
+            "range_used": (alt_edges[0], alt_edges[-1]),
+            "min_color_name": color_name_for(alt_edges[0], alt_edges[0], alt_edges[-1]),
+            "max_color_name": color_name_for(alt_edges[-1], alt_edges[0], alt_edges[-1]),
+        },
+        "Speed": {
+            "enc_min": min(speeds_val) if speeds_val else 0.0,
+            "enc_max": max(speeds_val) if speeds_val else 1.0,
+            "mean": sp_mean_all,
+            "filtered_min": min(speeds_nonzero) if speeds_nonzero else 0.0,
+            "filtered_max": max(speeds_nonzero) if speeds_nonzero else 1.0,
+            "range_used": (sp_edges[0], sp_edges[-1]),
+            "min_color_name": color_name_for(sp_edges[0], sp_edges[0], sp_edges[-1]),
+            "max_color_name": color_name_for(sp_edges[-1], sp_edges[0], sp_edges[-1]),
+        },
+        "Climb": {
+            "enc_min": min(climbs_val) if climbs_val else 0.0,
+            "enc_max": max(climbs_val) if climbs_val else 0.0,
+            "mean": cl_mean_all,
+            "range_used": (cl_edges[0], cl_edges[-1]),
+            "min_color_name": color_name_for(cl_edges[0], cl_edges[0], cl_edges[-1]),
+            "max_color_name": color_name_for(cl_edges[-1], cl_edges[0], cl_edges[-1]),
+        },
+        "color_funcs": {"alt": alt_color, "speed": spd_color, "climb": clb_color},
+        "edges": {"alt": alt_edges, "speed": sp_edges, "climb": cl_edges},
+    }
+    return report
+
+# --------------------------- VISUALIZATION ---------------------------
+
+def kml_coords_string(coords: List[Tuple[float,float,float]]) -> str:
+    return "\n".join(f"{lon:.6f},{lat:.6f},{alt:.2f}" for lon,lat,alt in coords)
+
+def make_style(style_id: str, color_hex: str, width: int = 3) -> str:
+    return (
+        f"\n    <Style id=\"{style_id}\">\n"
+        f"      <LineStyle><color>{color_hex}</color><width>{width}</width></LineStyle>\n"
+        f"    </Style>"
+    )
+
+def ensure_style(global_styles: Dict[str,str], style_id: str, color_hex: str, width: int = 3):
+    if style_id not in global_styles:
+        global_styles[style_id] = make_style(style_id, color_hex, width)
+
+def has_two_unique_coords(coords: List[Tuple[float,float,float]]) -> bool:
+    if len(coords) < 2:
+        return False
+    seen = set()
+    for lon,lat,alt in coords:
+        key = (round(lon,6), round(lat,6), round(alt,2))
+        seen.add(key)
+        if len(seen) >= 2:
+            return True
+    return False
+
+def compress_coords(coords: List[Tuple[float,float,float]], min_2d_m: float = 0.5, min_dalt_m: float = 0.5) -> List[Tuple[float,float,float]]:
+    if not coords: return coords
+    kept = [coords[0]]
+    for lon,lat,alt in coords[1:]:
+        lon0,lat0,alt0 = kept[-1]
+        if lon == lon0 and lat == lat0 and abs(alt-alt0) < 1e-6:
+            continue
+        d = haversine_m((lat0,lon0),(lat,lon))
+        if d < min_2d_m and abs(alt-alt0) < min_dalt_m:
+            continue
+        kept.append((lon,lat,alt))
+    return kept
 
 def build_visualization_folder(
     title: str,
     metric_values: List[float],
     points: List[dict],
     band_edges: List[float],
-    color_fn,
+    color_fn,  # value -> (r,g,b)
     base_style_prefix: str,
-    global_styles: Dict[str,str]
+    global_styles: Dict[str,str],
 ) -> str:
-    """
-    Create a Folder with:
-      - one continuous "Full Path (single line)" Placemark (unbroken) with curtain (extrude=1)
-      - a "Colored Segments" subfolder (segments + curtains)
-
-    Skips any line that would have <2 unique coordinates after compression.
-    """
-    # Pre-create band styles
+    # Styles per band (opaque for path, semi-opaque for curtain)
     for i in range(len(band_edges)-1):
         mid_val = (band_edges[i] + band_edges[i+1]) * 0.5
         r,g,b = color_fn(mid_val)
-        col_opaq = color_argb(0xFF, r, g, b)
-        col_trans = color_argb(0x99, r, g, b)
-        ensure_style(global_styles, f"{base_style_prefix}_band{i}", col_opaq, width=3)
-        ensure_style(global_styles, f"{base_style_prefix}_band{i}_curtain", col_trans, width=2)
+        ensure_style(global_styles, f"{base_style_prefix}_band{i}", color_argb(0xFF, r, g, b), width=3)
+        ensure_style(global_styles, f"{base_style_prefix}_band{i}_curtain", color_argb(0xCC, r, g, b), width=2)
 
     folder_xml = []
 
-    # Continuous full path + curtain
+    # Continuous full path (single line)
     full_coords_raw = [(p["lon"], p["lat"], p["alt_gps"]) for p in points]
     full_coords = compress_coords(full_coords_raw)
-    if len(full_coords) >= 2:
-        mid_idx = (len(band_edges)-1)//2
-        mid_center = (band_edges[max(0, mid_idx-1)] + band_edges[mid_idx]) * 0.5 if mid_idx > 0 else band_edges[0]
-        mid_color = color_argb(0xFF, *color_fn(mid_center))
+    if has_two_unique_coords(full_coords):
+        mid_val = (band_edges[0] + band_edges[-1]) * 0.5
+        r_mid,g_mid,b_mid = color_fn(mid_val)
         full_style_id = f"{base_style_prefix}_full"
-        ensure_style(global_styles, full_style_id, mid_color, width=3)
-        full_curtain_style_id = f"{base_style_prefix}_full_curtain"
-        ensure_style(global_styles, full_curtain_style_id, color_argb(0x99, *color_fn(mid_center)), width=2)
+        ensure_style(global_styles, full_style_id, color_argb(0xFF, r_mid, g_mid, b_mid), width=3)
 
         folder_xml.append(f"""
     <Placemark>
@@ -314,7 +501,6 @@ def build_visualization_folder(
       <description>{title}</description>
       <styleUrl>#{full_style_id}</styleUrl>
       <LineString>
-        <extrude>1</extrude>
         <tessellate>1</tessellate>
         <altitudeMode>absolute</altitudeMode>
         <coordinates>
@@ -323,30 +509,18 @@ def build_visualization_folder(
       </LineString>
     </Placemark>""")
 
-        folder_xml.append(f"""
-    <Placemark>
-      <name>Full Path Curtain</name>
-      <styleUrl>#{full_curtain_style_id}</styleUrl>
-      <LineString>
-        <extrude>1</extrude>
-        <tessellate>1</tessellate>
-        <altitudeMode>absolute</altitudeMode>
-        <coordinates>
-{kml_coords_string(full_coords)}
-        </coordinates>
-      </LineString>
-    </Placemark>""")
-
-    # Colored segments subfolder
-    runs = segment_runs_by_band(metric_values, band_edges)
+    # Colored segments
+    runs = segment_runs_by_band(metric_values, band_edges, min_run_pts=MIN_RUN_PTS)
     colored_parts = []
     for (s, e, bidx) in runs:
         if e - s + 1 < 2:
             continue
         seg_coords_raw = [(points[i]["lon"], points[i]["lat"], points[i]["alt_gps"]) for i in range(s, e+1)]
         seg_coords = compress_coords(seg_coords_raw)
-        if len(seg_coords) < 2:
-            continue  # skip zero-length segments
+        if not has_two_unique_coords(seg_coords):
+            continue
+
+        # Path segment
         colored_parts.append(f"""
     <Placemark>
       <name>Flight Path Segment</name>
@@ -359,7 +533,10 @@ def build_visualization_folder(
 {kml_coords_string(seg_coords)}
         </coordinates>
       </LineString>
-    </Placemark>
+    </Placemark>""")
+
+        # Matching curtain (same color)
+        colored_parts.append(f"""
     <Placemark>
       <name>Flight Path Curtain</name>
       <styleUrl>#{base_style_prefix}_band{bidx}_curtain</styleUrl>
@@ -373,7 +550,6 @@ def build_visualization_folder(
       </LineString>
     </Placemark>""")
 
-    # Only include the "Colored Segments" folder if something is inside
     colored_folder = f"""
       <Folder>
         <name>Colored Segments</name>
@@ -389,129 +565,84 @@ def build_visualization_folder(
     </Folder>
     """
 
-def build_kml_document(points: List[dict], takeoff_idx: int, landing_idx: int,
-                       units: str = "metric", band_mode: str = "fixed") -> Tuple[str, Dict[str,str]]:
-    """
-    units: "metric" or "imperial"
-    band_mode: "fixed" (use typical ranges by unit) or "auto" (data-driven)
-    """
-    # Work on flight segment
+# --------------------------- DOCUMENT BUILD ---------------------------
+
+def detect_takeoff_landing(points: List[dict]) -> Tuple[int, int]:
+    if len(points) < 2:
+        return 0, max(0, len(points)-1)
+    speeds = compute_speeds_mps(points)
+    for i, p in enumerate(points):
+        if not p.get("valid", True):
+            speeds[i] = 0.0
+    takeoff_idx = 0
+    take_win = 10
+    for i in range(take_win - 1, len(points)):
+        if all(speeds[j] > 8.0 for j in range(i - take_win + 1, i + 1)):
+            takeoff_idx = i - take_win + 1
+            break
+    landing_idx = len(points) - 1
+    land_win = 15
+    for i in range(len(points) - land_win - 1, takeoff_idx + land_win - 1, -1):
+        if all(speeds[j] < 5.0 for j in range(i, i + land_win)):
+            landing_idx = i + land_win - 1
+            break
+    return max(0, min(takeoff_idx, len(points)-1)), max(takeoff_idx, min(landing_idx, len(points)-1))
+
+def build_kml_document(points: List[dict], takeoff_idx: int, landing_idx: int, units: str):
+    # Segment (valid fixes, strictly increasing time)
     segment = points[takeoff_idx:landing_idx+1]
     seg_valid = [p for p in segment if p.get('valid', True)]
     if len(seg_valid) >= 2:
         segment = seg_valid
-    # Ensure strictly increasing time
     cleaned = [segment[0]]
     for p in segment[1:]:
         if p["time"] > cleaned[-1]["time"]:
             cleaned.append(p)
     segment = cleaned
 
-    # Metrics (base units: m, m/s)
+    # Metrics (base units)
     speeds_mps = compute_speeds_mps(segment)
     climbs_mps = compute_climb_mps(segment)
     alts_m = [p["alt_gps"] for p in segment]
 
-    # Convert for color ranges based on unit choice (KML alt stays in meters)
+    # Convert for coloring/report (KML z stays meters)
     if units == "imperial":
-        # speed -> mph, climb -> ft/min, altitude -> feet (for band edges only)
         speeds_val = [mps_to_mph(v) for v in speeds_mps]
         climbs_val = [mps_to_fpm(v) for v in climbs_mps]
         alts_val   = [m_to_ft(h)   for h in alts_m]
-        # Typical fixed ranges resembling imperial-styled visuals
-        fixed_speed_range = (0.0, 120.0)    # mph
-        fixed_climb_abs   = 1000.0          # ±1000 fpm
-        # altitude uses min/max of flight in chosen unit
-        fixed_alt_range   = (min(alts_val), max(alts_val)) if alts_val else (0.0, 1000.0)
     else:
-        # metric (default): speed -> km/h, climb -> m/s, altitude -> meters
         speeds_val = [mps_to_kmh(v) for v in speeds_mps]
         climbs_val = climbs_mps[:]
         alts_val   = alts_m[:]
-        fixed_speed_range = (0.0, 200.0)    # km/h
-        fixed_climb_abs   = 5.0             # ±5 m/s (~±984 fpm)
-        fixed_alt_range   = (min(alts_val), max(alts_val)) if alts_val else (0.0, 1000.0)
 
-    # Build band edges
-    def edges_linear(vmin: float, vmax: float, bands: int = 12) -> List[float]:
-        if vmax <= vmin:
-            vmax = vmin + 1.0
-        return [vmin + i*(vmax-vmin)/bands for i in range(bands+1)]
+    # Build ranges + colors
+    report = build_ranges_and_colors(alts_val, speeds_val, climbs_val, units)
+    alt_edges = report["edges"]["alt"]; sp_edges = report["edges"]["speed"]; cl_edges = report["edges"]["climb"]
+    alt_color = report["color_funcs"]["alt"]; spd_color = report["color_funcs"]["speed"]; clb_color = report["color_funcs"]["climb"]
 
-    def edges_auto(vals: List[float], bands: int = 12) -> List[float]:
-        if not vals:
-            return edges_linear(0.0, 1.0, bands)
-        vmin, vmax = min(vals), max(vals)
-        return edges_linear(vmin, vmax, bands)
-
-    # Altitude edges
-    alt_edges = edges_auto(alts_val, 12) if band_mode == "auto" else edges_linear(fixed_alt_range[0], fixed_alt_range[1], 12)
-    # Speed edges
-    spd_edges = edges_auto(speeds_val, 12) if band_mode == "auto" else edges_linear(fixed_speed_range[0], fixed_speed_range[1], 12)
-    # Climb edges (diverging)
-    if band_mode == "auto":
-        # symmetric around 0 using 5th/95th percentiles in chosen unit
-        def percentile(vals: List[float], p: float) -> float:
-            if not vals: return 0.0
-            s = sorted(vals)
-            k = max(0, min(len(s)-1, int(round(p*(len(s)-1)))))
-            return s[k]
-        c5, c95 = percentile(climbs_val, 0.05), percentile(climbs_val, 0.95)
-        cmax = max(abs(c5), abs(c95), (fixed_climb_abs if units=="imperial" else fixed_climb_abs)) or 1.0
-    else:
-        cmax = fixed_climb_abs
-    climb_edges = [-cmax + i*(2*cmax)/12 for i in range(13)]
-
-    # Color functions
-    def alt_color(val):
-        vmin, vmax = alt_edges[0], alt_edges[-1]
-        t = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
-        return ramp_blue_red(t)
-
-    def spd_color(val):
-        vmin, vmax = spd_edges[0], spd_edges[-1]
-        t = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
-        return ramp_blue_red(t)
-
-    def climb_color(val):
-        return ramp_diverging(val, vmax=cmax)
-
-    # Global styles registry
+    # Styles registry
     global_styles: Dict[str,str] = {}
 
-    # Visualization folders
+    # Folders (Altitude / Climb / Speed)
     viz_folders = []
     viz_folders.append(build_visualization_folder(
-        title="Altitude Colored Path",
-        metric_values=alts_val,
-        points=segment,
-        band_edges=alt_edges,
-        color_fn=alt_color,
-        base_style_prefix="alt",
-        global_styles=global_styles
+        title=f"Altitude Colored Path ({report['units']['alt']})",
+        metric_values=alts_val, points=segment, band_edges=alt_edges,
+        color_fn=alt_color, base_style_prefix="alt", global_styles=global_styles
     ))
     viz_folders.append(build_visualization_folder(
-        title=f"Climb Rate Colored Path ({'ft/min' if units=='imperial' else 'm/s'})",
-        metric_values=climbs_val,
-        points=segment,
-        band_edges=climb_edges,
-        color_fn=climb_color,
-        base_style_prefix="climb",
-        global_styles=global_styles
+        title=f"Climb Rate Colored Path ({report['units']['climb']})",
+        metric_values=climbs_val, points=segment, band_edges=cl_edges,
+        color_fn=clb_color, base_style_prefix="climb", global_styles=global_styles
     ))
     viz_folders.append(build_visualization_folder(
-        title=f"Speed Colored Path ({'mph' if units=='imperial' else 'km/h'})",
-        metric_values=speeds_val,
-        points=segment,
-        band_edges=spd_edges,
-        color_fn=spd_color,
-        base_style_prefix="speed",
-        global_styles=global_styles
+        title=f"Speed Colored Path ({report['units']['speed']})",
+        metric_values=speeds_val, points=segment, band_edges=sp_edges,
+        color_fn=spd_color, base_style_prefix="speed", global_styles=global_styles
     ))
 
-    # Takeoff/Landing placemarks
-    take = points[takeoff_idx]
-    land = points[landing_idx]
+    # Waypoints
+    take = points[takeoff_idx]; land = points[landing_idx]
     global_styles["takeoff"] = """
     <Style id="takeoff">
       <IconStyle><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle>
@@ -538,12 +669,12 @@ def build_kml_document(points: List[dict], takeoff_idx: int, landing_idx: int,
     {waypoints}
   </Folder>
   """
-    return doc_content, global_styles
+
+    return doc_content, global_styles, report
 
 # --------------------------- MAIN ---------------------------
 
-def convert_igc_to_kml(igc_path: Path, out_kml_path: Path, max_out_pts: int = 10000,
-                       units: str = "metric", band_mode: str = "fixed"):
+def convert_igc_to_kml(igc_path: Path, out_kml_path: Path, max_out_pts: int = 10000, units: str = "metric"):
     txt = igc_path.read_text(errors="ignore")
     date, points = parse_igc_datetime_and_points(txt)
     if len(points) < 2:
@@ -552,12 +683,11 @@ def convert_igc_to_kml(igc_path: Path, out_kml_path: Path, max_out_pts: int = 10
     # Detect flight segment on original points
     to_idx, ld_idx = detect_takeoff_landing(points)
 
-    # Resample entire points first so visuals are consistent and ≤ max points
+    # Resample to ≤ max points
     points_rs = resample_to_max(points, max_points=max_out_pts)
 
-    # Map detected indices to resampled list via nearest timestamps
-    t_take = points[to_idx]["time"]
-    t_land = points[ld_idx]["time"]
+    # Map indices to resampled by nearest timestamps
+    t_take = points[to_idx]["time"]; t_land = points[ld_idx]["time"]
     def nearest_index(ts):
         best_i, best_dt = 0, None
         for i, p in enumerate(points_rs):
@@ -568,11 +698,10 @@ def convert_igc_to_kml(igc_path: Path, out_kml_path: Path, max_out_pts: int = 10
     to_idx_rs = nearest_index(t_take)
     ld_idx_rs = max(to_idx_rs+1, nearest_index(t_land))
 
-    # Build KML document content and collect ALL styles
-    doc_content, global_styles = build_kml_document(points_rs, to_idx_rs, ld_idx_rs,
-                                                    units=units, band_mode=band_mode)
+    # Build KML + styles + report
+    doc_content, global_styles, report = build_kml_document(points_rs, to_idx_rs, ld_idx_rs, units=units)
 
-    # Emit styles at top-level Document BEFORE features
+    # Emit styles before features
     styles_xml = "\n".join(global_styles[k] for k in sorted(global_styles.keys()))
 
     kml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -585,24 +714,44 @@ def convert_igc_to_kml(igc_path: Path, out_kml_path: Path, max_out_pts: int = 10
 </kml>"""
 
     out_kml_path.write_text(kml, encoding="utf-8")
+
+    # ---------- Console report (color names) ----------
     print(f"Wrote KML: {out_kml_path}")
     print(f"Detected takeoff index: {to_idx}, landing index: {ld_idx}, total points: {len(points)}")
     print(f"Output track was limited to at most {max_out_pts} points (interpolated if necessary).")
-    print(f"Units: {units} | Band mode: {band_mode}")
+    print(f"Units: {units} | Robust trimming quantiles: [{Q_LOW:.2f}, {Q_HIGH:.2f}]")
+
+    # Altitude
+    alt = report["Altitude"]
+    print(f"\nAltitude ({report['units']['alt']}): mean={alt['mean']:.3f}")
+    print(f"  Encountered min: {alt['enc_min']:.3f} -> color {alt['min_color_name']}")
+    print(f"  Encountered max: {alt['enc_max']:.3f} -> color {alt['max_color_name']}")
+    print(f"  Color range used: [{alt['range_used'][0]:.3f}, {alt['range_used'][1]:.3f}] (exact min/max)")
+
+    # Speed
+    spd = report["Speed"]
+    print(f"\nSpeed ({report['units']['speed']}): mean={spd['mean']:.3f}")
+    print(f"  Encountered min/max: {spd['enc_min']:.3f} / {spd['enc_max']:.3f} (filtered for range: {spd['filtered_min']:.3f}+)")
+    print(f"  Color range used: [{spd['range_used'][0]:.3f}, {spd['range_used'][1]:.3f}] "
+          f"→ min color {spd['min_color_name']}, max color {spd['max_color_name']}")
+
+    # Climb
+    clb = report["Climb"]
+    print(f"\nClimb ({report['units']['climb']}): mean={clb['mean']:.3f}")
+    print(f"  Encountered min/max: {clb['enc_min']:.3f} / {clb['enc_max']:.3f}")
+    print(f"  Color range used: [{clb['range_used'][0]:.3f}, {clb['range_used'][1]:.3f}] "
+          f"→ min color {clb['min_color_name']}, max color {clb['max_color_name']}")
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Convert IGC to KML with continuous path + curtain, colored visualizations (Altitude/Climb/Speed), unit-aware banding, and ≤ max points.")
+    parser = argparse.ArgumentParser(description="IGC → KML with rainbow colors, baro-based climb, robust ranges, steady segments, and matching curtains.")
     parser.add_argument("igc", help="Path to input .igc file")
     parser.add_argument("-o", "--out", help="Output KML path (default: same name with .kml)", default=None)
     parser.add_argument("--max-points", type=int, default=10000, help="Maximum output points (default 10000)")
     parser.add_argument("--units", choices=["metric","imperial"], default="metric",
-                        help="Color band units/ranges (metric: km/h & m/s, imperial: mph & ft/min).")
-    parser.add_argument("--band-mode", choices=["fixed","auto"], default="fixed",
-                        help="fixed: use typical unit-based ranges; auto: data-driven min/max (and percentiles for climb).")
+                        help="Units for band ranges (metric: km/h & m/s; imperial: mph & ft/min).")
     args = parser.parse_args()
 
     igc_path = Path(args.igc)
     out_path = Path(args.out) if args.out else igc_path.with_suffix(".kml")
-    convert_igc_to_kml(igc_path, out_path, max_out_pts=args.max_points,
-                       units=args.units, band_mode=args.band_mode)
+    convert_igc_to_kml(igc_path, out_path, max_out_pts=args.max_points, units=args.units)
